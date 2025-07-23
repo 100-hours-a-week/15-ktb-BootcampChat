@@ -1,6 +1,7 @@
 import axios from 'axios';
 import socketService from './socket';
 import { Toast } from '../components/Toast';
+import axiosInstance from "./axios";
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL;
 
