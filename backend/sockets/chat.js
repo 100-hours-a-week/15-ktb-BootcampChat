@@ -7,6 +7,10 @@ const { jwtSecret } = require('../config/keys');
 const redisClient = require('../utils/redisClient');
 const SessionService = require('../services/sessionService');
 const aiService = require('../services/aiService');
+const { publishReadStatus } = require('../utils/rabbitProducer');
+
+const CACHE_TTL_SECONDS = 30;
+const READ_CACHE_TTL_SECONDS = 600;
 
 module.exports = function(io) {
   const connectedUsers = new Map();
@@ -31,65 +35,89 @@ module.exports = function(io) {
 
   // 메시지 일괄 로드 함수 개선
   const loadMessages = async (socket, roomId, before, limit = BATCH_SIZE) => {
+    const cacheKey = `messages:${roomId}:${before || 'latest'}`;
+
+    // 캐시 조회
+    if (!before) {
+      const cached = await redisClient.get(cacheKey);
+      if (cached && typeof cached === 'object') {
+        return cached;
+      }
+    }
+
     const timeoutPromise = new Promise((_, reject) => {
-      setTimeout(() => {
-        reject(new Error('Message loading timed out'));
-      }, MESSAGE_LOAD_TIMEOUT);
+      setTimeout(() => reject(new Error('Message loading timed out')), MESSAGE_LOAD_TIMEOUT);
     });
 
     try {
-      // 쿼리 구성
-      const query = { room: roomId };
+      // 쿼리 구성 - 로컬 삭제된 메시지 제외
+      const query = { 
+        room: roomId,
+        localDeletedFor: { $ne: socket.user.id }
+      };
       if (before) {
         query.timestamp = { $lt: new Date(before) };
       }
 
       // 메시지 로드 with profileImage
-      const messages = await Promise.race([
+      const rawMessages = await Promise.race([
         Message.find(query)
-          .populate('sender', 'name email profileImage')
-          .populate({
-            path: 'file',
-            select: 'filename originalname mimetype size'
-          })
-          .sort({ timestamp: -1 })
-          .limit(limit + 1)
-          .lean(),
+            .populate('sender', 'name email profileImage')
+            .populate({
+              path: 'file',
+              select: 'filename originalname mimetype size url storageType path'
+            })
+            .sort({ timestamp: -1 })
+            .limit(limit + 1),
         timeoutPromise
       ]);
 
-      // 결과 처리
-      const hasMore = messages.length > limit;
-      const resultMessages = messages.slice(0, limit);
-      const sortedMessages = resultMessages.sort((a, b) => 
-        new Date(a.timestamp) - new Date(b.timestamp)
-      );
+      const hasMore = rawMessages.length > limit;
+
+      const resultMessages = rawMessages
+          .slice(0, limit)
+          .sort((a, b) => new Date(a.timestamp) - new Date(b.timestamp));
+
+      // JSON.stringify 가능한 평문 객체로 변환
+      const plainMessages = resultMessages.map(msg => msg.toJSON());
+
+      if (!before && plainMessages.length > 0) {
+        await redisClient.setEx(
+            cacheKey,
+            CACHE_TTL_SECONDS,
+            JSON.stringify({
+              messages: plainMessages,
+              hasMore,
+              oldestTimestamp: plainMessages[0]?.timestamp || null
+            })
+        );
+      }
 
       // 읽음 상태 비동기 업데이트
-      if (sortedMessages.length > 0 && socket.user) {
-        const messageIds = sortedMessages.map(msg => msg._id);
+      if (plainMessages.length > 0 && socket.user) {
+        const messageIds = plainMessages.map(msg => msg._id);
         Message.updateMany(
-          {
-            _id: { $in: messageIds },
-            'readers.userId': { $ne: socket.user.id }
-          },
-          {
-            $push: {
-              readers: {
-                userId: socket.user.id,
-                readAt: new Date()
+            {
+              _id: { $in: messageIds },
+              'readers.userId': { $ne: socket.user.id }
+            },
+            {
+              $push: {
+                readers: {
+                  userId: socket.user.id,
+                  readAt: new Date()
+                }
               }
             }
-          }
         ).exec().catch(error => {
           console.error('Read status update error:', error);
         });
       }
 
       return {
-        messages: sortedMessages,
+        messages: plainMessages,
         hasMore,
-        oldestTimestamp: sortedMessages[0]?.timestamp || null
+        oldestTimestamp: plainMessages[0]?.timestamp || null
       };
     } catch (error) {
       if (error.message === 'Message loading timed out') {
@@ -491,8 +519,14 @@ module.exports = function(io) {
         switch (type) {
           case 'file':
             if (!fileData || !fileData._id) {
+              console.error('Invalid file data:', fileData);
               throw new Error('파일 데이터가 올바르지 않습니다.');
             }
+
+            console.log('Looking for file:', {
+              fileId: fileData._id,
+              userId: socket.user.id
+            });
 
             const file = await File.findOne({
               _id: fileData._id,
@@ -500,8 +534,30 @@ module.exports = function(io) {
             });
 
             if (!file) {
+              console.error('File not found:', {
+                fileId: fileData._id,
+                userId: socket.user.id
+              });
+              
+              // 모든 파일 확인 (디버깅용)
+              const allFiles = await File.find({ user: socket.user.id }).limit(5);
+              console.log('User files:', allFiles.map(f => ({
+                id: f._id,
+                filename: f.filename,
+                createdAt: f.createdAt
+              })));
+              
               throw new Error('파일을 찾을 수 없거나 접근 권한이 없습니다.');
             }
+
+            console.log('File found:', {
+              id: file._id,
+              filename: file.filename,
+              originalname: file.originalname,
+              storageType: file.storageType,
+              s3Key: file.s3Key,
+              url: file.url
+            });
 
             message = new Message({
               room,
@@ -542,8 +598,46 @@ module.exports = function(io) {
         await message.save();
         await message.populate([
           { path: 'sender', select: 'name email profileImage' },
-          { path: 'file', select: 'filename originalname mimetype size' }
+          { path: 'file', select: 'filename originalname mimetype size url storageType path' }
         ]);
+
+        // 캐시 키 구성
+        const cacheKey = `messages:${room}:latest`;
+
+        // 기존 캐시 불러오기
+        let cachedPayload;
+        try {
+          const cachedRaw = await redisClient.get(cacheKey);
+          cachedPayload = cachedRaw ? JSON.parse(cachedRaw) : null;
+        } catch (e) {
+          console.error('[Redis] 캐시 불러오기 실패:', e);
+        }
+
+        // 메시지를 JSON으로 변환
+        const plainMessage = message.toJSON();
+
+        // 캐시 업데이트
+        if (cachedPayload && Array.isArray(cachedPayload.messages)) {
+          cachedPayload.messages.push(plainMessage);
+          // 최신순 30개로 유지
+          cachedPayload.messages = cachedPayload.messages.slice(-30);
+          cachedPayload.oldestTimestamp = cachedPayload.messages[0]?.timestamp || null;
+        } else {
+          cachedPayload = {
+            messages: [plainMessage],
+            hasMore: true,
+            oldestTimestamp: plainMessage.timestamp
+          };
+        }
+
+        // 캐시 저장
+        await redisClient.setEx(
+            cacheKey,
+            CACHE_TTL_SECONDS,
+            JSON.stringify(cachedPayload)
+        );
+
+        console.log('[Redis] 캐시 갱신 완료:', cacheKey);
 
         io.to(room).emit('message', message);
 
@@ -677,6 +771,8 @@ module.exports = function(io) {
           }
         }
 
+
+
         // 현재 방에서 자동 퇴장 처리
         if (roomId) {
           // 다른 디바이스로 인한 연결 종료가 아닌 경우에만 처리
@@ -755,27 +851,44 @@ module.exports = function(io) {
           return;
         }
 
-        // 읽음 상태 업데이트
-        await Message.updateMany(
-          {
-            _id: { $in: messageIds },
-            room: roomId,
-            'readers.userId': { $ne: socket.user.id }
-          },
-          {
-            $push: {
-              readers: {
-                userId: socket.user.id,
-                readAt: new Date()
-              }
-            }
-          }
-        );
+        const cacheKey = `read:${roomId}:${socket.user.id}`;
+        const readAt = new Date();
 
+        // 1. Redis에 캐시 저장 (중복 방지용 TTL 포함)
+        await redisClient.setEx(cacheKey, READ_CACHE_TTL_SECONDS, readAt.toISOString());
+
+        // 2. Socket.io broadcast
         socket.to(roomId).emit('messagesRead', {
           userId: socket.user.id,
           messageIds
         });
+
+        // 3. RabbitMQ 비동기 영속화 요청
+        const uniqueMessageIds = [...new Set(messageIds)];
+
+        // [14] publishReadStatus 호출 직전
+        console.debug('[Socket.IO] 읽음 상태 MQ 발행 준비 - roomId=%s, userId=%s, messageCount=%d',
+            roomId,
+            socket.user.id,
+            uniqueMessageIds.length
+        );
+
+        try {
+          await publishReadStatus({
+            roomId,
+            userId: socket.user.id,
+            messageIds: uniqueMessageIds,
+            readAt: readAt.toISOString()
+          });
+        } catch (mqError) {
+          console.error('[Socket.IO] Failed to publish read status to RabbitMQ:', {
+            error: mqError.message,
+            stack: mqError.stack,
+            userId: socket.user.id,
+            roomId,
+            messageIds: uniqueMessageIds
+          });
+        }
 
       } catch (error) {
         console.error('Mark messages as read error:', error);
@@ -817,6 +930,8 @@ module.exports = function(io) {
         });
       }
     });
+
+
   });
 
   // AI 멘션 추출 함수

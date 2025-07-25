@@ -267,6 +267,7 @@ const ChatMessages = ({
   onLoadMore = () => {},
   onReactionAdd = () => {},
   onReactionRemove = () => {},
+  onMessageDelete = () => {},
   messagesEndRef,
   socketRef,
   scrollToBottomOnNewMessage = true,
@@ -279,6 +280,9 @@ const ChatMessages = ({
   const initialLoadRef = useRef(true);
   const loadingTimeoutRef = useRef(null);
   const scrollHandler = useRef(new ScrollHandler(containerRef));
+
+  console.log("messages: ",messages);
+  
 
   const logDebug = useCallback((action, data) => {
     console.debug(`[ChatMessages] ${action}:`, {
@@ -395,6 +399,32 @@ const ChatMessages = ({
     });
   }, [messages, streamingMessages]);
 
+  // 메시지 삭제 핸들러
+  const handleMessageDelete = useCallback(async (messageId) => {
+    try {
+      const response = await fetch(`${process.env.NEXT_PUBLIC_API_URL}/api/messages/${messageId}`, {
+        method: 'DELETE',
+        headers: {
+          'Content-Type': 'application/json',
+          'x-auth-token': JSON.parse(localStorage.getItem('user'))?.token,
+          'x-session-id': JSON.parse(localStorage.getItem('user'))?.sessionId
+        }
+      });
+
+      if (!response.ok) {
+        throw new Error('메시지 삭제에 실패했습니다.');
+      }
+
+      const responseData = await response.json();
+
+      // API 응답 데이터 반환
+      return responseData;
+    } catch (error) {
+      console.error('Message delete error:', error);
+      throw error;
+    }
+  }, [onMessageDelete]);
+
   const renderMessage = useCallback((msg, idx) => {
     if (!msg || !SystemMessage || !FileMessage || !UserMessage || !AIMessage) {
       console.error('Message component undefined:', {
@@ -412,19 +442,26 @@ const ChatMessages = ({
       currentUser,
       room,
       onReactionAdd,
-      onReactionRemove
+      onReactionRemove,
+      onMessageDelete: handleMessageDelete
     };
+
+    console.log("✅msg.type:",msg.type);
+    
+    
 
     const MessageComponent = {
       system: SystemMessage,
       file: FileMessage,
       ai: AIMessage
     }[msg.type] || UserMessage;
+    if(msg.type === "file") {
+      console.log("✅msg.component:",MessageComponent);
+    }
 
     return (
       <MessageComponent
         key={msg._id || `msg-${idx}`}
-        ref={isLast ? lastMessageRef : null}
         {...commonProps}
         msg={msg}
         content={msg.content}
@@ -434,7 +471,7 @@ const ChatMessages = ({
         socketRef={socketRef}
       />
     );
-  }, [allMessages.length, currentUser, room, isMine, onReactionAdd, onReactionRemove, socketRef]);
+  }, [allMessages.length, currentUser, room, isMine, onReactionAdd, onReactionRemove, handleMessageDelete, socketRef]);
 
   return (
     <div 

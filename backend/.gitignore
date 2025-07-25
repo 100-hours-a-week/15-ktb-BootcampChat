@@ -1,15 +1,15 @@
 # Node.js dependencies
-**/node_modules/
+node_modules/
 dist/
 build/
 .npmrc
-# 모든 위치의 환경변수 파일 무시
-**/.env
-**/.env.local
+.env.local
+.env
+uploads
 
 # Next.js
 .next/
-./frontend/out/
+out/
 
 test-results/
 
@@ -26,5 +26,3 @@ Thumbs.db
 
 # VSCode settings
 .vscode/
-
-e2e/playwright-report/data

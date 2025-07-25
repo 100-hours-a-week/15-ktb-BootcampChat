@@ -5,8 +5,12 @@ const mongoose = require("mongoose");
 const http = require("http");
 const socketIO = require("socket.io");
 const path = require("path");
+const { createClient } = require("redis");
+const { createAdapter } = require("@socket.io/redis-adapter");
 const { router: roomsRouter, initializeSocket } = require("./routes/api/rooms");
 const routes = require("./routes");
+const { redisHost, redisPort, mongo_URI } = require("./config/keys");
+const { initRabbitMQConnection } = require("./utils/rabbitProducer");
 
 const app = express();
 const server = http.createServer(app);
@@ -16,19 +20,29 @@ const PORT = process.env.PORT || 5001;
 app.set("trust proxy", 1);
 
 // CORS 설정
+const allowedOrigins = [
+  "https://bootcampchat-fe.run.goorm.site",
+  "https://bootcampchat-hgxbv.dev-k8s.arkain.io",
+  "http://localhost:3000",
+  "http://localhost:3001",
+  "http://localhost:3002",
+  "https://localhost:3000",
+  "https://localhost:3001",
+  "https://localhost:3002",
+  "http://0.0.0.0:3000",
+  "https://0.0.0.0:3000",
+  "http://43.203.103.251:3000", // 프론트엔드 도메인
+  "https://chat.goorm-ktb-015.goorm.team" // 프론트엔드 도메인
+];
+
 const corsOptions = {
-  origin: [
-    "https://bootcampchat-fe.run.goorm.site",
-    "https://bootcampchat-hgxbv.dev-k8s.arkain.io",
-    "http://localhost:3000",
-    "http://localhost:3001",
-    "http://localhost:3002",
-    "https://localhost:3000",
-    "https://localhost:3001",
-    "https://localhost:3002",
-    "http://0.0.0.0:3000",
-    "https://0.0.0.0:3000",
-  ],
+  origin: function (origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+    } else {
+      callback(new Error("Not allowed by CORS"));
+    }
+  },
   credentials: true,
   methods: ["GET", "POST", "PUT", "DELETE", "OPTIONS"],
   allowedHeaders: [
@@ -42,18 +56,21 @@ const corsOptions = {
   exposedHeaders: ["x-auth-token", "x-session-id"],
 };
 
+
+
 // 기본 미들웨어
 app.use(cors(corsOptions));
-app.use(express.json());
-app.use(express.urlencoded({ extended: true }));
 
 // OPTIONS 요청에 대한 처리
 app.options("*", cors(corsOptions));
 
+app.use(express.json());
+app.use(express.urlencoded({ extended: true }));
+
 // 정적 파일 제공
 app.use("/uploads", express.static(path.join(__dirname, "uploads")));
 
-// 요청 로깅
+// 요청 로깅 (개발 모드에서만)
 if (process.env.NODE_ENV === "development") {
   app.use((req, res, next) => {
     console.log(
@@ -77,10 +94,28 @@ app.use("/api", routes);
 
 // Socket.IO 설정
 const io = socketIO(server, { cors: corsOptions });
-require("./sockets/chat")(io);
 
-// Socket.IO 객체 전달
-initializeSocket(io);
+// // Socket.IO 객체 전달
+// initializeSocket(io);
+
+// Redis Adapter 설정
+async function setupSocketIOWithRedis() {
+  const pubClient = createClient({ url: `redis://${redisHost}:${redisPort}` });
+  const subClient = pubClient.duplicate();
+
+  try {
+    await Promise.all([pubClient.connect(), subClient.connect()]);
+    io.adapter(createAdapter(pubClient, subClient));
+    console.log("✅ Redis Pub/Sub 어댑터 연결 완료");
+
+    // Socket.IO 채팅 서버 로드
+    require("./sockets/chat")(io);
+    initializeSocket(io);
+  } catch (err) {
+    console.error("❌ Redis 어댑터 연결 실패:", err);
+    process.exit(1);
+  }
+}
 
 // 404 에러 핸들러
 app.use((req, res) => {
@@ -103,19 +138,34 @@ app.use((err, req, res, next) => {
 });
 
 // 서버 시작
-mongoose
-  .connect(process.env.MONGO_URI)
-  .then(() => {
-    console.log("MongoDB Connected");
+async function startServer() {
+  try {
+    // DB 연결
+    await mongoose.connect(mongo_URI, {
+      useNewUrlParser: true,
+      useUnifiedTopology: true,
+      // directConnection: true,
+    });
+    console.log("✅ MongoDB 연결 완료");
+
+    // Redis + Socket 설정
+    await setupSocketIOWithRedis();
+
+    // RabbitMQ 연결 시도
+    await initRabbitMQConnection();
+
+    // 서버 시작
     server.listen(PORT, "0.0.0.0", () => {
-      console.log(`Server running on port ${PORT}`);
+      console.log(`🚀 Server running on port ${PORT}`);
       console.log("Environment:", process.env.NODE_ENV);
       console.log("API Base URL:", `http://0.0.0.0:${PORT}/api`);
     });
-  })
-  .catch((err) => {
-    console.error("Server startup error:", err);
+  } catch (err) {
+    console.error("❌ MongoDB connection error:", err);
     process.exit(1);
-  });
+  }
+}
+
+startServer();
 
 module.exports = { app, server };

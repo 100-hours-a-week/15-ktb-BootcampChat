@@ -22,17 +22,24 @@ class MockRedisClient {
   async get(key) {
     const item = this.store.get(key);
     if (!item) return null;
-    
+
     if (item.expires && Date.now() > item.expires) {
       this.store.delete(key);
       return null;
     }
-    
-    try {
-      return JSON.parse(item.value);
-    } catch {
-      return item.value;
+
+    const value = item.value;
+
+    // string일 때만 parse
+    if (typeof value === 'string') {
+      try {
+        return JSON.parse(value);
+      } catch {
+        return value;
+      }
     }
+
+    return value; // 이미 객체라면 그대로 반환
   }
 
   async setEx(key, seconds, value) {
@@ -68,6 +75,24 @@ class RedisClient {
     this.useMock = false;
   }
 
+  switchToMock() {
+    try {
+      if (this.client && !this.useMock) {
+        this.client.removeAllListeners();
+        this.client.disconnect().catch(() => {});
+      }
+      this.client = new MockRedisClient();
+      this.isConnected = true;
+      this.useMock = true;
+      console.log('Successfully switched to mock Redis client');
+    } catch (error) {
+      console.error('Error switching to mock Redis:', error);
+      this.client = new MockRedisClient();
+      this.isConnected = true;
+      this.useMock = true;
+    }
+  }
+
   async connect() {
     if (this.isConnected && this.client) {
       return this.client;
@@ -94,9 +119,7 @@ class RedisClient {
           reconnectStrategy: (retries) => {
             if (retries > this.maxRetries) {
               console.log('Max Redis reconnection attempts reached, switching to in-memory mock');
-              this.client = new MockRedisClient();
-              this.isConnected = true;
-              this.useMock = true;
+              this.switchToMock();
               return false;
             }
             return Math.min(retries * 50, 2000);
@@ -114,10 +137,21 @@ class RedisClient {
         console.error('Redis Client Error:', err.message);
         if (!this.useMock) {
           console.log('Switching to in-memory mock Redis');
-          this.client = new MockRedisClient();
-          this.isConnected = true;
-          this.useMock = true;
+          this.switchToMock();
         }
+      });
+
+      this.client.on('end', () => {
+        console.log('Redis connection ended');
+        if (!this.useMock) {
+          console.log('Switching to in-memory mock Redis due to connection end');
+          this.switchToMock();
+        }
+      });
+
+      this.client.on('disconnect', () => {
+        console.log('Redis disconnected');
+        this.isConnected = false;
       });
 
       await this.client.connect();
@@ -126,9 +160,7 @@ class RedisClient {
     } catch (error) {
       console.error('Redis connection failed:', error.message);
       console.log('Using in-memory mock Redis instead');
-      this.client = new MockRedisClient();
-      this.isConnected = true;
-      this.useMock = true;
+      this.switchToMock();
       return this.client;
     }
   }
